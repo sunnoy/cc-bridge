@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::model::account::{Account, CanonicalEnvData, CanonicalProcessData};
+use crate::model::mimic_profile;
 use crate::service::account::AccountService;
 use crate::store::account_store::AccountStore;
 
@@ -32,7 +33,9 @@ const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
 
 /// 判断请求路径是否为遥测端点。
 pub fn is_telemetry_path(path: &str) -> bool {
+    // 2.1.196 客户端使用 /api/event_logging/v2/batch；保留旧 /event_logging/batch 作兼容
     path.contains("/event_logging/batch")
+        || path.contains("/event_logging/v2/batch")
         || path.starts_with("/api/eval/")
         || path.starts_with("/api/claude_code/metrics")
         || path.starts_with("/api/claude_code/organizations/metrics_enabled")
@@ -272,19 +275,17 @@ async fn telemetry_loop(
             && now >= session.next_event_allowed_at
         {
             // uptime 对标 process.uptime()：从 "进程启动" 算起，而非从首次 API 调用算起
-            let uptime_secs = session.uptime_offset_secs
-                + now.duration_since(session.started_at).as_secs_f64();
+            let uptime_secs =
+                session.uptime_offset_secs + now.duration_since(session.started_at).as_secs_f64();
             // 更新累积 CPU 指标（模拟 process.cpuUsage 单调递增）
             let wall_delta_ms = now.duration_since(session.last_cpu_update).as_millis() as i64;
             // 限定 rng 作用域：避免 ThreadRng (非 Send) 跨 .await
             let (user_delta, system_delta, jitter_secs, mem_drifts) = {
                 let mut rng = rand::thread_rng();
-                let u = rng.gen_range(
-                    (wall_delta_ms.max(1) * 5)..=(wall_delta_ms.max(1) * 30).max(1),
-                );
-                let s = rng.gen_range(
-                    (wall_delta_ms.max(1) * 2)..=(wall_delta_ms.max(1) * 10).max(1),
-                );
+                let u =
+                    rng.gen_range((wall_delta_ms.max(1) * 5)..=(wall_delta_ms.max(1) * 30).max(1));
+                let s =
+                    rng.gen_range((wall_delta_ms.max(1) * 2)..=(wall_delta_ms.max(1) * 10).max(1));
                 let j = rng.gen_range(3u64..=12);
                 // 每个内存字段 ±3% 漂移（对标 process.memoryUsage() 的自然漂移）
                 let mut drift = || rng.gen_range(-0.03f64..=0.03f64);
@@ -362,7 +363,7 @@ async fn telemetry_loop(
 
             send_telemetry(
                 &c,
-                &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                &format!("{}/api/event_logging/v2/batch", UPSTREAM_BASE),
                 &token,
                 &payload,
                 &session_ua(&store, account_id).await,
@@ -441,15 +442,9 @@ async fn telemetry_loop(
 }
 
 /// 从 account store 获取最新的 UA 版本号。
-async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
-    let version = store
-        .get_by_id(account_id)
-        .await
-        .ok()
-        .and_then(|a| serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok())
-        .map(|e| e.version)
-        .unwrap_or_else(|| "2.1.81".into());
-    format!("claude-code/{}", version)
+async fn session_ua(_store: &Arc<AccountStore>, _account_id: i64) -> String {
+    // telemetry UA 随二进制固定，所有真实客户端一致 → 统一 profile
+    mimic_profile::user_agent_code(mimic_profile::VERSION)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +751,10 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
             let tool_names = ["Read", "Bash", "Edit", "Grep", "Glob"];
             let tool_idx = (ctx.cpu_user_total as usize) % tool_names.len();
             m.insert("toolName".into(), json!(tool_names[tool_idx]));
-            m.insert("durationMs".into(), json!(rand::thread_rng().gen_range(5i64..800)));
+            m.insert(
+                "durationMs".into(),
+                json!(rand::thread_rng().gen_range(5i64..800)),
+            );
             m.insert("isMcp".into(), json!(false));
         }
         events.push(wrap(ev));
@@ -839,14 +837,14 @@ mod tests {
             platform: "darwin".into(),
             platform_raw: "darwin".into(),
             arch: "arm64".into(),
-            node_version: "v22.15.0".into(),
+            node_version: mimic_profile::NODE_VERSION.into(),
             terminal: "iTerm.app".into(),
             package_managers: "npm,pnpm".into(),
             runtimes: "node".into(),
             is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
+            version: mimic_profile::VERSION.into(),
+            version_base: mimic_profile::VERSION.into(),
+            build_time: mimic_profile::BUILD_TIME.into(),
             deployment_environment: "unknown-darwin".into(),
             vcs: "git".into(),
             ..Default::default()
@@ -934,9 +932,7 @@ mod tests {
             .as_array()
             .expect("events array")
             .iter()
-            .find(|e| {
-                e["event_data"]["event_name"].as_str() == Some("tengu_api_success")
-            })
+            .find(|e| e["event_data"]["event_name"].as_str() == Some("tengu_api_success"))
             .expect("tengu_api_success event missing")["event_data"]
             .as_object()
             .unwrap()
@@ -973,8 +969,8 @@ mod tests {
         let account = make_account();
         let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
         let betas = event_data(&batch)["betas"].as_str().unwrap().to_string();
-        let expected = crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5")
-            .join(",");
+        let expected =
+            crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5").join(",");
         assert_eq!(betas, expected);
         assert!(
             betas.contains("claude-code-20250219"),
@@ -1010,21 +1006,20 @@ mod tests {
             betas
         );
         assert!(
-            betas.contains("oauth-2025-04-20"),
-            "legacy haiku still needs oauth beta, got: {}",
+            !betas.contains("oauth-2025-04-20"),
+            "messages 已不再发送 oauth-2025-04-20，legacy haiku 同样不发, got: {}",
             betas
         );
     }
 
     #[test]
-    fn event_batch_haiku_4_5_keeps_isp_and_context_but_strips_claude_code() {
+    fn event_batch_haiku_4_5_includes_claude_code_and_context() {
         let account = make_account();
-        let batch =
-            build_event_batch(ctx_for(&account, "claude-haiku-4-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-haiku-4-5", "sid", 0, 0, false));
         let betas = event_data(&batch)["betas"].as_str().unwrap();
         assert!(
-            !betas.contains("claude-code-20250219"),
-            "haiku-4-5 must not advertise claude-code beta, got: {}",
+            betas.contains("claude-code-20250219"),
+            "实测 2.1.196：haiku-4-5 发送 claude-code-20250219, got: {}",
             betas
         );
         assert!(
@@ -1044,8 +1039,30 @@ mod tests {
     #[test]
     fn process_json_cpu_usage_is_cumulative() {
         let proc = make_proc();
-        let p1 = build_process_json(&proc, 1.0, 400_000_000, 150_000_000, 60_000_000, 2_000_000, 30_000, 1_000_000, 500_000, 0.5);
-        let p2 = build_process_json(&proc, 2.0, 400_000_000, 150_000_000, 60_000_000, 2_000_000, 30_000, 2_500_000, 900_000, 0.7);
+        let p1 = build_process_json(
+            &proc,
+            1.0,
+            400_000_000,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            1_000_000,
+            500_000,
+            0.5,
+        );
+        let p2 = build_process_json(
+            &proc,
+            2.0,
+            400_000_000,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            2_500_000,
+            900_000,
+            0.7,
+        );
 
         let u1 = p1["cpuUsage"]["user"].as_i64().unwrap();
         let u2 = p2["cpuUsage"]["user"].as_i64().unwrap();
@@ -1066,7 +1083,18 @@ mod tests {
     #[test]
     fn process_json_uptime_is_passed_through() {
         let proc = make_proc();
-        let p = build_process_json(&proc, 42.5, 400_000_000, 150_000_000, 60_000_000, 2_000_000, 30_000, 0, 0, 0.0);
+        let p = build_process_json(
+            &proc,
+            42.5,
+            400_000_000,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            0,
+            0,
+            0.0,
+        );
         assert_eq!(p["uptime"].as_f64().unwrap(), 42.5);
         assert_eq!(p["constrainedMemory"].as_i64().unwrap(), 0);
     }
@@ -1076,10 +1104,35 @@ mod tests {
         // 关键测试：rss/heapTotal/heapUsed 必须原样透传，而不是 random_in_range。
         // 修复前：同一个函数调用两次会得到不同随机值；修复后：完全确定性。
         let proc = make_proc();
-        let p1 = build_process_json(&proc, 1.0, 400_123_456, 150_000_000, 60_000_000, 2_000_000, 30_000, 0, 0, 0.0);
-        let p2 = build_process_json(&proc, 1.0, 400_123_456, 150_000_000, 60_000_000, 2_000_000, 30_000, 0, 0, 0.0);
+        let p1 = build_process_json(
+            &proc,
+            1.0,
+            400_123_456,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            0,
+            0,
+            0.0,
+        );
+        let p2 = build_process_json(
+            &proc,
+            1.0,
+            400_123_456,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            0,
+            0,
+            0.0,
+        );
         assert_eq!(p1["rss"].as_i64(), Some(400_123_456));
-        assert_eq!(p1["rss"], p2["rss"], "same input → same output (not random)");
+        assert_eq!(
+            p1["rss"], p2["rss"],
+            "same input → same output (not random)"
+        );
         assert_eq!(p1["heapUsed"].as_i64(), Some(60_000_000));
     }
 
@@ -1088,7 +1141,14 @@ mod tests {
     #[test]
     fn event_batch_contains_all_tengu_api_success_fields() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 1_000, 500, false));
+        let batch = build_event_batch(ctx_for(
+            &account,
+            "claude-sonnet-4-5",
+            "sid",
+            1_000,
+            500,
+            false,
+        ));
         let data = event_data(&batch);
 
         let required = [
@@ -1163,7 +1223,14 @@ mod tests {
     #[test]
     fn event_batch_session_id_is_passed_through() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "fixed-sid-123", 0, 0, false));
+        let batch = build_event_batch(ctx_for(
+            &account,
+            "claude-sonnet-4-5",
+            "fixed-sid-123",
+            0,
+            0,
+            false,
+        ));
         let data = event_data(&batch);
         assert_eq!(
             data["session_id"].as_str(),
@@ -1175,9 +1242,19 @@ mod tests {
     #[test]
     fn event_batch_session_id_is_same_across_all_events_in_batch() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid-same", 0, 0, true));
+        let batch = build_event_batch(ctx_for(
+            &account,
+            "claude-sonnet-4-5",
+            "sid-same",
+            0,
+            0,
+            true,
+        ));
         let events = batch["events"].as_array().unwrap();
-        assert!(events.len() >= 2, "batch should have multiple events when emit_startup=true");
+        assert!(
+            events.len() >= 2,
+            "batch should have multiple events when emit_startup=true"
+        );
         for ev in events {
             assert_eq!(
                 ev["event_data"]["session_id"].as_str(),
@@ -1206,13 +1283,15 @@ mod tests {
     #[test]
     fn event_batch_emit_startup_adds_tengu_startup_once() {
         let account = make_account();
-        let batch_first = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, true));
+        let batch_first =
+            build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, true));
         assert!(
             find_event(&batch_first, "tengu_startup").is_some(),
             "first batch (emit_startup=true) must include tengu_startup"
         );
 
-        let batch_second = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
+        let batch_second =
+            build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
         assert!(
             find_event(&batch_second, "tengu_startup").is_none(),
             "subsequent batches (emit_startup=false) must NOT include tengu_startup"
@@ -1263,6 +1342,7 @@ mod tests {
 
     #[test]
     fn is_telemetry_path_matches_known_endpoints() {
+        assert!(is_telemetry_path("/api/event_logging/v2/batch"));
         assert!(is_telemetry_path("/api/event_logging/batch"));
         assert!(is_telemetry_path("/api/eval/sdk-zAZezfDKGoZuXXKe"));
         assert!(is_telemetry_path("/api/claude_code/metrics"));

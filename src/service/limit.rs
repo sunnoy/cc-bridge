@@ -163,9 +163,7 @@ impl RpmTpmSnapshot {
 
 /// 判定某个 counter 是否已进入预抢阶段：remaining/limit < PREEMPT_RATIO 且 reset 未到。
 fn counter_preempted(c: &RpmTpmCounter, now: DateTime<Utc>) -> bool {
-    c.limit > 0
-        && (c.remaining as f64) / (c.limit as f64) < PREEMPT_RATIO
-        && c.reset_at > now
+    c.limit > 0 && (c.remaining as f64) / (c.limit as f64) < PREEMPT_RATIO && c.reset_at > now
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,6 +298,18 @@ impl LimitStore {
         match map.get(&account_id) {
             Some(state) => judge_availability(state, model_class),
             None => Availability::Available,
+        }
+    }
+
+    /// 客户端 `/v1/usage` 用：返回某账号的额度热态 JSON（five_hour/seven_day 的
+    /// utilization 已是 0-100 百分比 + resets_at RFC3339，形状对齐 `/api/oauth/usage`）。
+    /// 数据全部来自转发 /v1/messages 时吸头存进内存的热态，**不触发任何上游请求**。
+    /// 账号尚无热态（未发过请求）时返回空对象 `{}`。
+    pub fn usage_json(&self, account_id: i64) -> serde_json::Value {
+        let map = self.states.lock().unwrap();
+        match map.get(&account_id) {
+            Some(state) => build_usage_json(state),
+            None => serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -715,13 +725,14 @@ fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
 }
 
 /// 前后两轮 RPM/TPM 比较：上一轮无任何 counter 预抢、这一轮有 → true。
-fn rpm_tpm_newly_preempted(
-    prev: &Option<RpmTpmSnapshot>,
-    new: &Option<RpmTpmSnapshot>,
-) -> bool {
+fn rpm_tpm_newly_preempted(prev: &Option<RpmTpmSnapshot>, new: &Option<RpmTpmSnapshot>) -> bool {
     let now = Utc::now();
-    let prev_preempted = prev.as_ref().is_some_and(|p| p.first_preempted(now).is_some());
-    let new_preempted = new.as_ref().is_some_and(|n| n.first_preempted(now).is_some());
+    let prev_preempted = prev
+        .as_ref()
+        .is_some_and(|p| p.first_preempted(now).is_some());
+    let new_preempted = new
+        .as_ref()
+        .is_some_and(|n| n.first_preempted(now).is_some());
     new_preempted && !prev_preempted
 }
 
@@ -962,9 +973,15 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-status", "allowed"),
             ("anthropic-ratelimit-unified-7d-utilization", "0.03"),
             ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
-            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "org_level_disabled",
+            ),
             ("anthropic-ratelimit-unified-overage-status", "rejected"),
-            ("anthropic-ratelimit-unified-representative-claim", "five_hour"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
             ("anthropic-ratelimit-unified-reset", "1776427200"),
             ("anthropic-ratelimit-unified-status", "allowed"),
         ])
@@ -1222,7 +1239,8 @@ mod tests {
     }
 
     #[test]
-    fn build_usage_json_converts_to_0_100_scale() {        let state = LimitState {
+    fn build_usage_json_converts_to_0_100_scale() {
+        let state = LimitState {
             five_hour: Some(WindowSnapshot {
                 utilization: 0.14,
                 resets_at: DateTime::from_timestamp(1776427200, 0).unwrap(),
@@ -1254,7 +1272,8 @@ mod tests {
     fn absorb_429_cf_without_headers_sets_60s_ban() {
         let h = make_headers(&[("content-type", "text/html")]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         let until = new.rate_limited_until.expect("rate_limited_until set");
         let expected = Utc::now() + chrono::Duration::seconds(60);
         // 允许 2 秒误差（测试机 clock 漂移）
@@ -1268,7 +1287,8 @@ mod tests {
     fn absorb_429_cf_with_retry_after_uses_it() {
         let h = make_headers(&[("retry-after", "120")]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         let until = new.rate_limited_until.expect("rate_limited_until set");
         let expected = Utc::now() + chrono::Duration::seconds(120);
         let diff = (until - expected).num_seconds().abs();
@@ -1288,7 +1308,8 @@ mod tests {
             ("retry-after", "300"),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         // 5h 窗口应被正常吸收
         assert!(new.five_hour.is_some());
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
@@ -1315,7 +1336,8 @@ mod tests {
             ("anthropic-ratelimit-unified-reset", &reset_ts.to_string()),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         assert!(new.rate_limited_until.is_none(), "不应走 fallback 路径");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         // availability 应判 Unavailable（5h 97%）
@@ -1398,10 +1420,16 @@ mod tests {
             ("anthropic-ratelimit-tokens-remaining", "998000".into()),
             ("anthropic-ratelimit-tokens-reset", reset.clone()),
             ("anthropic-ratelimit-input-tokens-limit", "500000".into()),
-            ("anthropic-ratelimit-input-tokens-remaining", "499000".into()),
+            (
+                "anthropic-ratelimit-input-tokens-remaining",
+                "499000".into(),
+            ),
             ("anthropic-ratelimit-input-tokens-reset", reset.clone()),
             ("anthropic-ratelimit-output-tokens-limit", "500000".into()),
-            ("anthropic-ratelimit-output-tokens-remaining", "499000".into()),
+            (
+                "anthropic-ratelimit-output-tokens-remaining",
+                "499000".into(),
+            ),
             ("anthropic-ratelimit-output-tokens-reset", reset),
         ]
     }
@@ -1596,7 +1624,8 @@ mod tests {
     fn absorb_200_with_rpm_tpm_updates_state() {
         let h = headers_from(rpm_tpm_full_headers());
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
         assert!(new.rpm_tpm.is_some());
         let rt = new.rpm_tpm.unwrap();
         assert_eq!(rt.requests.unwrap().limit, 50);
@@ -1614,7 +1643,8 @@ mod tests {
         ]);
         let h = headers_from(headers);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
         assert!(new.five_hour.is_some(), "unified 路径应被吸收");
         assert!(new.rpm_tpm.is_some(), "RPM/TPM 路径应被吸收");
     }
@@ -1664,16 +1694,29 @@ mod tests {
             ),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Sonnet, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Sonnet, 429, &h).expect("should produce state");
         // status 丢弃 —— 不禁用账号
-        assert_eq!(new.status, None, "rep_claim=seven_day_sonnet 时 status 必须丢弃");
+        assert_eq!(
+            new.status, None,
+            "rep_claim=seven_day_sonnet 时 status 必须丢弃"
+        );
         // 7d 走 Sonnet overlay
-        assert!(new.sonnet_seven_day.is_some(), "7d 数据路由到 sonnet_seven_day");
+        assert!(
+            new.sonnet_seven_day.is_some(),
+            "7d 数据路由到 sonnet_seven_day"
+        );
         assert!(new.seven_day.is_none(), "账号级 seven_day 不被污染");
         // 5h 仍按账号级吸收
-        assert!(new.five_hour.is_some(), "5h 是账号级事实，Sonnet 也必须吸收");
+        assert!(
+            new.five_hour.is_some(),
+            "5h 是账号级事实，Sonnet 也必须吸收"
+        );
         // representative_claim 吸收（UI 展示用）
-        assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
+        assert_eq!(
+            new.representative_claim.as_deref(),
+            Some("seven_day_sonnet")
+        );
         // availability：Opus 不受影响；Sonnet 因 sonnet_seven_day=100% 被拦
         assert!(judge_availability(&new, ModelClass::Opus).is_available());
         assert!(!judge_availability(&new, ModelClass::Sonnet).is_available());
@@ -1692,7 +1735,8 @@ mod tests {
             ),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
@@ -1709,7 +1753,8 @@ mod tests {
                 "seven_day",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
@@ -1726,7 +1771,8 @@ mod tests {
                 "five_hour",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
@@ -1743,9 +1789,13 @@ mod tests {
                 "seven_day_sonnet",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Sonnet, 200, &h).expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Sonnet, 200, &h).expect("state");
         assert_eq!(new.status, None, "rep_claim=seven_day_sonnet → status 丢弃");
-        assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
+        assert_eq!(
+            new.representative_claim.as_deref(),
+            Some("seven_day_sonnet")
+        );
     }
 
     #[test]
@@ -1760,10 +1810,7 @@ mod tests {
     #[test]
     fn is_sonnet_rejection_false_for_other_claims() {
         for claim in ["seven_day_opus", "seven_day", "five_hour"] {
-            let h = make_headers(&[(
-                "anthropic-ratelimit-unified-representative-claim",
-                claim,
-            )]);
+            let h = make_headers(&[("anthropic-ratelimit-unified-representative-claim", claim)]);
             assert!(!is_sonnet_rejection(&h), "claim={} should not match", claim);
         }
         let h_empty = make_headers(&[]);
@@ -1847,9 +1894,12 @@ mod tests {
             ),
             ("retry-after", "30"),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Sonnet, 429, &h)
-            .expect("state");
-        assert!(new.sonnet_rate_limited_until.is_some(), "Sonnet overlay 应设置");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Sonnet, 429, &h).expect("state");
+        assert!(
+            new.sonnet_rate_limited_until.is_some(),
+            "Sonnet overlay 应设置"
+        );
         assert!(new.rate_limited_until.is_none(), "账号级不应被污染");
     }
 
@@ -1864,8 +1914,8 @@ mod tests {
             ),
             ("retry-after", "30"),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h)
-            .expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert!(new.rate_limited_until.is_some());
         assert!(new.sonnet_rate_limited_until.is_none());
     }

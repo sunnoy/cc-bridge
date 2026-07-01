@@ -3,93 +3,96 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::account::{CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData};
+use super::mimic_profile;
 
 fn env_presets() -> Vec<CanonicalEnvData> {
+    // node_version / version / build_time 随二进制固定，统一由 mimic_profile 提供；
+    // 这里只保留逐机器变化的 platform / arch / terminal / package_managers 多样性。
     vec![
         // --- darwin arm64 (8 presets) ---
-        dp("arm64", "v22.15.0", "iTerm.app", "npm,pnpm"),
-        dp("arm64", "v24.3.0", "Apple_Terminal", "npm,yarn"),
-        dp("arm64", "v22.15.0", "vscode", "npm,pnpm"),
-        dp("arm64", "v24.3.0", "WarpTerminal", "npm"),
-        dp("arm64", "v22.15.0", "kitty", "npm,yarn,pnpm"),
-        dp("arm64", "v24.3.0", "iTerm.app", "npm"),
-        dp("arm64", "v22.15.0", "tmux", "npm,pnpm"),
-        dp("arm64", "v24.3.0", "ghostty", "npm,yarn"),
+        dp("arm64", "iTerm.app", "npm,pnpm"),
+        dp("arm64", "Apple_Terminal", "npm,yarn"),
+        dp("arm64", "vscode", "npm,pnpm"),
+        dp("arm64", "WarpTerminal", "npm"),
+        dp("arm64", "kitty", "npm,yarn,pnpm"),
+        dp("arm64", "iTerm.app", "npm"),
+        dp("arm64", "tmux", "npm,pnpm"),
+        dp("arm64", "ghostty", "npm,yarn"),
         // --- darwin x64 (4 presets) ---
-        dx("v22.15.0", "iTerm.app", "npm,yarn"),
-        dx("v24.3.0", "Apple_Terminal", "npm,pnpm"),
-        dx("v22.15.0", "vscode", "npm"),
-        dx("v24.3.0", "iTerm.app", "npm,pnpm"),
+        dx("iTerm.app", "npm,yarn"),
+        dx("Apple_Terminal", "npm,pnpm"),
+        dx("vscode", "npm"),
+        dx("iTerm.app", "npm,pnpm"),
         // --- linux (6 presets) ---
-        lp("v22.15.0", "gnome-terminal", "npm,pnpm"),
-        lp("v24.3.0", "ssh-session", "npm"),
-        lp("v22.15.0", "xterm-256color", "npm,yarn"),
-        lp("v24.3.0", "vscode", "npm,pnpm"),
-        lp("v22.15.0", "tmux", "npm"),
-        lp("v24.3.0", "alacritty", "npm,yarn"),
+        lp("gnome-terminal", "npm,pnpm"),
+        lp("ssh-session", "npm"),
+        lp("xterm-256color", "npm,yarn"),
+        lp("vscode", "npm,pnpm"),
+        lp("tmux", "npm"),
+        lp("alacritty", "npm,yarn"),
         // --- win32 (4 presets) ---
-        wp("v22.15.0", "windows-terminal", "npm,pnpm"),
-        wp("v24.3.0", "vscode", "npm,yarn"),
-        wp("v22.15.0", "mingw64", "npm"),
-        wp("v24.3.0", "windows-terminal", "npm,pnpm"),
+        wp("windows-terminal", "npm,pnpm"),
+        wp("vscode", "npm,yarn"),
+        wp("mingw64", "npm"),
+        wp("windows-terminal", "npm,pnpm"),
     ]
 }
 
-fn dp(arch: &str, node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+fn dp(arch: &str, term: &str, pm: &str) -> CanonicalEnvData {
     CanonicalEnvData {
         platform: "darwin".into(),
         platform_raw: "darwin".into(),
         arch: arch.into(),
-        node_version: node.into(),
+        node_version: mimic_profile::NODE_VERSION.into(),
         terminal: term.into(),
         package_managers: pm.into(),
         runtimes: "node".into(),
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: mimic_profile::VERSION.into(),
+        version_base: mimic_profile::VERSION.into(),
+        build_time: mimic_profile::BUILD_TIME.into(),
         deployment_environment: "unknown-darwin".into(),
         vcs: "git".into(),
         ..Default::default()
     }
 }
 
-fn dx(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
-    dp("x64", node, term, pm)
+fn dx(term: &str, pm: &str) -> CanonicalEnvData {
+    dp("x64", term, pm)
 }
 
-fn lp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+fn lp(term: &str, pm: &str) -> CanonicalEnvData {
     CanonicalEnvData {
         platform: "linux".into(),
         platform_raw: "linux".into(),
         arch: "x64".into(),
-        node_version: node.into(),
+        node_version: mimic_profile::NODE_VERSION.into(),
         terminal: term.into(),
         package_managers: pm.into(),
         runtimes: "node".into(),
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: mimic_profile::VERSION.into(),
+        version_base: mimic_profile::VERSION.into(),
+        build_time: mimic_profile::BUILD_TIME.into(),
         deployment_environment: "unknown-linux".into(),
         vcs: "git".into(),
         ..Default::default()
     }
 }
 
-fn wp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+fn wp(term: &str, pm: &str) -> CanonicalEnvData {
     CanonicalEnvData {
         platform: "win32".into(),
         platform_raw: "win32".into(),
         arch: "x64".into(),
-        node_version: node.into(),
+        node_version: mimic_profile::NODE_VERSION.into(),
         terminal: term.into(),
         package_managers: pm.into(),
         runtimes: "node".into(),
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: mimic_profile::VERSION.into(),
+        version_base: mimic_profile::VERSION.into(),
+        build_time: mimic_profile::BUILD_TIME.into(),
         deployment_environment: "unknown-win32".into(),
         vcs: "git".into(),
         ..Default::default()
@@ -175,7 +178,7 @@ pub fn build_full_env_json(env: &CanonicalEnvData) -> Value {
         "platform": env.platform,
         "platform_raw": env.platform_raw,
         "arch": env.arch,
-        "node_version": env.node_version,
+        "node_version": mimic_profile::NODE_VERSION,
         "terminal": env.terminal,
         "package_managers": env.package_managers,
         "runtimes": env.runtimes,
@@ -188,9 +191,9 @@ pub fn build_full_env_json(env: &CanonicalEnvData) -> Value {
         "is_github_action": false,
         "is_claude_code_action": false,
         "is_claude_ai_auth": env.is_claude_ai_auth,
-        "version": env.version,
-        "version_base": env.version_base,
-        "build_time": env.build_time,
+        "version": mimic_profile::VERSION,
+        "version_base": mimic_profile::VERSION,
+        "build_time": mimic_profile::BUILD_TIME,
         "deployment_environment": env.deployment_environment,
         "vcs": env.vcs,
         "github_event_name": "",

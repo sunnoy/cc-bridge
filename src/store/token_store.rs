@@ -12,8 +12,7 @@ pub struct TokenStore {
 const TOKEN_COLS: &str =
     "id, name, token, allowed_accounts, blocked_accounts, status, created_at, updated_at";
 
-const TOKEN_COLS_PG_TEXT: &str =
-    "id, name, token, allowed_accounts, blocked_accounts, status, created_at::text AS created_at, updated_at::text AS updated_at";
+const TOKEN_COLS_PG_TEXT: &str = "id, name, token, allowed_accounts, blocked_accounts, status, created_at::text AS created_at, updated_at::text AS updated_at";
 
 impl TokenStore {
     pub fn new(pool: AnyPool, driver: String) -> Self {
@@ -119,7 +118,10 @@ impl TokenStore {
 
     /// 按 ID 查询
     pub async fn get_by_id(&self, id: i64) -> Result<ApiToken, AppError> {
-        let q = format!("SELECT {} FROM api_tokens WHERE id=$1", self.select_token_cols());
+        let q = format!(
+            "SELECT {} FROM api_tokens WHERE id=$1",
+            self.select_token_cols()
+        );
         let row = sqlx::query(&q)
             .bind(id)
             .fetch_optional(&self.pool)

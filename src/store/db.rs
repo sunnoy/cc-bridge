@@ -93,7 +93,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     // 增量迁移 — only ALTER columns that are actually missing, so remote-DB startups
     // don't pay ~20 round-trips for ALTERs that would otherwise fail with "column
     // already exists" and get swallowed by .ok().
-    let ts_type = if driver == "sqlite" { "TEXT" } else { "TIMESTAMPTZ" };
+    let ts_type = if driver == "sqlite" {
+        "TEXT"
+    } else {
+        "TIMESTAMPTZ"
+    };
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
     let cols = existing_columns(pool, driver, "accounts").await;
 
@@ -104,11 +108,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         ),
         (
             "usage_data",
-            format!("ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'", json_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'",
+                json_type
+            ),
         ),
         (
             "usage_fetched_at",
-            format!("ALTER TABLE accounts ADD COLUMN usage_fetched_at {}", ts_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN usage_fetched_at {}",
+                ts_type
+            ),
         ),
         (
             "auth_type",
@@ -124,11 +134,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         ),
         (
             "oauth_expires_at",
-            format!("ALTER TABLE accounts ADD COLUMN oauth_expires_at {}", ts_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN oauth_expires_at {}",
+                ts_type
+            ),
         ),
         (
             "oauth_refreshed_at",
-            format!("ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}", ts_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}",
+                ts_type
+            ),
         ),
         (
             "auth_error",
@@ -176,10 +192,12 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
                 .unwrap_or(false)
         };
         if needs_type("usage_data", "jsonb") {
-            sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
-                .execute(pool)
-                .await
-                .ok();
+            sqlx::query(
+                "ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB",
+            )
+            .execute(pool)
+            .await
+            .ok();
         }
         if needs_type("usage_fetched_at", "timestamp with time zone") {
             sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")

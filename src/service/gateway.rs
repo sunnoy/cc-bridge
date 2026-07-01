@@ -23,6 +23,30 @@ use crate::store::cache::CacheStore;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 
+/// 真实 Claude Code 2.1.196 `/v1/messages` 抓包的固定 SDK header 顺序（小写匹配）。
+/// 之前用 `HashMap` 迭代转发，wire 顺序随机 → 易被指纹。这里按抓包顺序确定性发出。
+/// `accept-encoding` 与 `Host` 不在此列：对齐 GOLD 尾部，在 SDK 块之后单独追加。
+const CANONICAL_HEADER_ORDER: &[&str] = &[
+    "accept",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-claude-code-session-id",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-timeout",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "x-app",
+    "x-client-request-id",
+];
+
 fn perf_enabled() -> bool {
     static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
     *PERF_ENABLED.get_or_init(|| std::env::var("PERF_TRACE").ok().as_deref() == Some("1"))
@@ -118,6 +142,25 @@ impl GatewayService {
         }
     }
 
+    /// 客户端额度查询：根据 token 选出代表账号，返回其内存热态额度 JSON。
+    /// **不打上游**——数据全部来自转发 /v1/messages 时吸头存进 LimitStore 的热态。
+    /// 供 statusline 等客户端轮询显示 5h/7d 用量，绕开 claude 对 token 认证不填
+    /// stdin `rate_limits` 的门控。无可用账号 / 账号尚无热态时返回空对象 `{}`。
+    pub async fn usage_for_token(&self, api_token: Option<&ApiToken>) -> serde_json::Value {
+        let (allowed_ids, blocked_ids) = match api_token {
+            Some(t) => (t.allowed_account_ids(), t.blocked_account_ids()),
+            None => (vec![], vec![]),
+        };
+        match self
+            .account_svc
+            .representative_account_id(&allowed_ids, &blocked_ids)
+            .await
+        {
+            Some(id) => self.limit_store.usage_json(id),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
     /// 核心网关逻辑 -- axum handler。
     pub async fn handle_request(&self, req: Request, api_token: Option<&ApiToken>) -> Response {
         match self.handle_request_inner(req, api_token).await {
@@ -138,7 +181,11 @@ impl GatewayService {
         macro_rules! cp {
             ($name:expr) => {
                 let _now = Instant::now();
-                perf_log(&rid, $name, _now.duration_since(t_prev).as_secs_f64() * 1000.0);
+                perf_log(
+                    &rid,
+                    $name,
+                    _now.duration_since(t_prev).as_secs_f64() * 1000.0,
+                );
                 t_prev = _now;
             };
         }
@@ -185,10 +232,7 @@ impl GatewayService {
 
         // Sonnet 请求旁路：让本地限流状态不拦截 Sonnet，由 Anthropic 自己拒。
         // 约定：request body 里 model 字段含 "sonnet"（大小写不敏感）即认定为 Sonnet。
-        let model_id_for_class = body_map
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let model_id_for_class = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
         let model_class = crate::service::limit::ModelClass::from_model_id(model_id_for_class);
 
         // 黏性透传策略：429 不再 retry 其它账号（换号会 bust prompt cache，成本爆炸）。
@@ -255,9 +299,9 @@ impl GatewayService {
             "request body BEFORE rewrite: {}",
             truncate_body(&body_bytes, 4096)
         );
-        let rewritten_body =
-            self.rewriter
-                .rewrite_body(&body_bytes, &path, &account, client_type);
+        let rewritten_body = self
+            .rewriter
+            .rewrite_body(&body_bytes, &path, &account, client_type);
         debug!(
             "request body AFTER rewrite: {}",
             truncate_body(&rewritten_body, 4096)
@@ -283,7 +327,10 @@ impl GatewayService {
         };
         cp!("rewrite");
 
-        let upstream_token = self.account_svc.resolve_upstream_token_with(&account).await?;
+        let upstream_token = self
+            .account_svc
+            .resolve_upstream_token_with(&account)
+            .await?;
         let mut final_headers = rewritten_headers;
         final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
         cp!("resolve_token");
@@ -329,10 +376,7 @@ impl GatewayService {
                 account.id
             );
         } else {
-            warn!(
-                "account {} returned 429 (sticky, no retry)",
-                account.id
-            );
+            warn!("account {} returned 429 (sticky, no retry)", account.id);
         }
         Ok(wrap_429_response(resp))
     }
@@ -375,11 +419,96 @@ impl GatewayService {
             _ => client.post(&target_url),
         };
 
-        for (k, v) in headers {
+        // 按真实 Claude Code 抓包的固定顺序发出 SDK header（HashMap 顺序随机是指纹破绽）。
+        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in CANONICAL_HEADER_ORDER {
+            if let Some((k, v)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                debug!("upstream header: {}: {}", k, v);
+                req_builder = req_builder.header(k, v);
+                emitted.insert(k.to_ascii_lowercase());
+            }
+        }
+        // 其余未列出的 header（除 accept-encoding）：按名字典序稳定追加，避免随机顺序。
+        let mut leftovers: Vec<(&String, &String)> = headers
+            .iter()
+            .filter(|(k, _)| {
+                let lk = k.to_ascii_lowercase();
+                !emitted.contains(&lk) && lk != "accept-encoding"
+            })
+            .collect();
+        leftovers.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in leftovers {
             debug!("upstream header: {}: {}", k, v);
             req_builder = req_builder.header(k, v);
         }
+        // 尾部：Host，再 accept-encoding（对齐 GOLD：…x-client-request-id, Host, Accept-Encoding）。
         req_builder = req_builder.header("Host", "api.anthropic.com");
+        if path.starts_with("/api/oauth/usage") {
+            // 额度查询等 JSON 端点：强制 identity。API 模式的 header 合成会强制
+            // accept-encoding=gzip（为 /v1/messages mimic），但上游 gzip 后 cc-bridge
+            // 原样透传，无 gzip 解码能力的客户端（如 statusline-pro 的 ureq，仅 json+tls
+            // feature）会当成乱码。此类非 messages 端点 mimic 无关紧要，明文更通用。
+            req_builder = req_builder.header("accept-encoding", "identity");
+        } else if let Some((k, v)) = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        {
+            req_builder = req_builder.header(k, v);
+        }
+        // 调试探针：把转发 body + 出站 header 落盘，供与原生 claude 端到端对比。仅 /v1/messages，
+        // 且需显式设置 CCB_CMP_PROBE_DIR 环境变量才生效；留空即 no-op，生产无副作用。
+        if path.starts_with("/v1/messages") {
+            if let Ok(dir) = std::env::var("CCB_CMP_PROBE_DIR") {
+                use std::io::Write;
+                let n = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let p = std::path::Path::new(&dir).join(format!("ccb_{}.json", n));
+                if let Ok(mut f) = std::fs::File::create(&p) {
+                    let _ = f.write_all(body);
+                }
+                // 同步落盘出站 header（按真实发出的 wire 顺序），供 header 线序/值对比。
+                // Authorization 含真实 OAuth token → 脱敏，绝不落盘。
+                let fmt = |k: &String, v: &String| -> String {
+                    if k.eq_ignore_ascii_case("authorization") {
+                        format!("{}: <redacted>", k)
+                    } else {
+                        format!("{}: {}", k, v)
+                    }
+                };
+                let mut lines: Vec<String> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for name in CANONICAL_HEADER_ORDER {
+                    if let Some((k, v)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                        lines.push(fmt(k, v));
+                        seen.insert(k.to_ascii_lowercase());
+                    }
+                }
+                let mut rest: Vec<(&String, &String)> = headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        let lk = k.to_ascii_lowercase();
+                        !seen.contains(&lk) && lk != "accept-encoding"
+                    })
+                    .collect();
+                rest.sort_by(|a, b| a.0.cmp(b.0));
+                for (k, v) in rest {
+                    lines.push(fmt(k, v));
+                }
+                lines.push("Host: api.anthropic.com".to_string());
+                if let Some((k, v)) = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+                {
+                    lines.push(fmt(k, v));
+                }
+                let hp = std::path::Path::new(&dir).join(format!("ccb_{}.headers", n));
+                if let Ok(mut hf) = std::fs::File::create(&hp) {
+                    let _ = hf.write_all(lines.join("\n").as_bytes());
+                }
+            }
+        }
         req_builder = req_builder.body(body.to_vec());
         perf_log(rid, "forward_prep", tls_t0.elapsed().as_secs_f64() * 1000.0);
 
@@ -388,7 +517,11 @@ impl GatewayService {
             warn!("upstream error for account {}: {}", account.id, e);
             AppError::BadGateway("upstream request failed".into())
         })?;
-        perf_log(rid, "upstream_send_ttfb", send_t0.elapsed().as_secs_f64() * 1000.0);
+        perf_log(
+            rid,
+            "upstream_send_ttfb",
+            send_t0.elapsed().as_secs_f64() * 1000.0,
+        );
 
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
@@ -410,7 +543,9 @@ impl GatewayService {
         // 对空闲 2xx 响应且无 unified-* 字段：无副作用直接 return false。
         // 对 429 响应：即使无 unified-* 字段也会设短期隔离（retry-after 或默认 60s），避免并发请求反复撞同一账号。
         let absorb_t0 = Instant::now();
-        let should_flush = self.limit_store.absorb_headers(account.id, model_class, status_code, resp.headers());
+        let should_flush =
+            self.limit_store
+                .absorb_headers(account.id, model_class, status_code, resp.headers());
         if should_flush {
             let ls = self.limit_store.clone();
             let aid = account.id;
@@ -420,7 +555,11 @@ impl GatewayService {
                 }
             });
         }
-        perf_log(rid, "absorb_headers", absorb_t0.elapsed().as_secs_f64() * 1000.0);
+        perf_log(
+            rid,
+            "absorb_headers",
+            absorb_t0.elapsed().as_secs_f64() * 1000.0,
+        );
 
         // 构建响应
         let mut response_builder = Response::builder()
@@ -499,9 +638,7 @@ fn wrap_429_response(resp: Response) -> Response {
     builder = builder.header("content-type", "application/json");
     builder
         .body(Body::from(GENERIC_429_BODY))
-        .unwrap_or_else(|_| {
-            (StatusCode::TOO_MANY_REQUESTS, GENERIC_429_BODY).into_response()
-        })
+        .unwrap_or_else(|_| (StatusCode::TOO_MANY_REQUESTS, GENERIC_429_BODY).into_response())
 }
 
 /// 5xx 黏性透传策略：把上游的 500-599 响应包装成 Anthropic 格式的通用 api_error。
@@ -606,10 +743,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            !slot_is_free(&cache, key).await,
-            "acquire 之后槽位应被占用"
-        );
+        assert!(!slot_is_free(&cache, key).await, "acquire 之后槽位应被占用");
 
         let holder = SlotHolder::new(cache.clone(), key.into());
         drop(holder);
@@ -634,10 +768,7 @@ mod tests {
         holder.disarm();
         settle().await;
 
-        assert!(
-            !slot_is_free(&cache, key).await,
-            "disarm 不应触发释放"
-        );
+        assert!(!slot_is_free(&cache, key).await, "disarm 不应触发释放");
         // 兜底清理
         cache.release_slot(key).await;
     }
@@ -708,10 +839,7 @@ mod tests {
 
     impl Stream for ReadyStream {
         type Item = u32;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             if self.remaining == 0 {
                 Poll::Ready(None)
             } else {
@@ -729,10 +857,7 @@ mod tests {
 
     impl Stream for ChanStream {
         type Item = u32;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             match self.rx.poll_recv(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => Poll::Ready(None),
@@ -789,10 +914,7 @@ mod tests {
 
         // 读到 None（流耗尽）之前，槽位必须持续被持有
         while wrapper.as_mut().next().await.is_some() {
-            assert!(
-                !slot_is_free(&cache, key).await,
-                "流未结束期间槽位不能释放"
-            );
+            assert!(!slot_is_free(&cache, key).await, "流未结束期间槽位不能释放");
         }
 
         // 这里流已返回 None；但 SlotHolder 仍在 wrapper 里没 drop
@@ -804,10 +926,7 @@ mod tests {
         drop(wrapper);
         settle().await;
 
-        assert!(
-            slot_is_free(&cache, key).await,
-            "wrapper drop 后槽位应释放"
-        );
+        assert!(slot_is_free(&cache, key).await, "wrapper drop 后槽位应释放");
     }
 
     #[tokio::test]
@@ -910,10 +1029,7 @@ mod tests {
         cache.release_slot(key).await;
         drop(streams);
         settle().await;
-        assert!(
-            slot_is_free(&cache, key).await,
-            "全部流 drop 后槽位应归零"
-        );
+        assert!(slot_is_free(&cache, key).await, "全部流 drop 后槽位应归零");
     }
 
     /// 验证 pin_project 的透明性 + 异步 poll 行为：使用 ChanStream 让 poll_next
@@ -1056,25 +1172,23 @@ mod tests {
             "应是通用文案: {}",
             text
         );
-        assert!(
-            !text.contains("Sonnet"),
-            "不应泄漏原 body 细节: {}",
-            text
-        );
+        assert!(!text.contains("Sonnet"), "不应泄漏原 body 细节: {}", text);
     }
 
     #[tokio::test]
     async fn wrap_429_response_drops_content_length_and_sets_json_ctype() {
         // 原响应带错误的 content-length 和 text/html 类型 → 包装后应被覆盖为 application/json
         let original = make_429(
-            &[
-                ("content-length", "999"),
-                ("content-type", "text/html"),
-            ],
+            &[("content-length", "999"), ("content-type", "text/html")],
             b"<html>rate limited</html>",
         );
         let wrapped = wrap_429_response(original);
-        let ct = wrapped.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = wrapped
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(ct, "application/json");
         // content-length 原值不应存在（axum 会按实际 body 重算或不设）
         let cl_values: Vec<_> = wrapped.headers().get_all("content-length").iter().collect();
@@ -1096,11 +1210,17 @@ mod tests {
         );
         let wrapped = wrap_429_response(original);
         assert_eq!(
-            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("60")
         );
         assert_eq!(
-            wrapped.headers().get("x-custom-debug").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("x-custom-debug")
+                .and_then(|v| v.to_str().ok()),
             Some("abc")
         );
         // anthropic-ratelimit-* 默认也保留（用户明确选了"body only"包装，不动 header）
@@ -1134,7 +1254,11 @@ mod tests {
         assert_eq!(wrapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = to_bytes(wrapped.into_body(), 4096).await.unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("api_error"), "应包含 api_error type: {}", text);
+        assert!(
+            text.contains("api_error"),
+            "应包含 api_error type: {}",
+            text
+        );
         assert!(text.contains("Upstream error"), "应是通用文案: {}", text);
         assert!(!text.contains("Traceback"), "不应泄漏堆栈: {}", text);
         assert!(!text.contains("core.py"), "不应泄漏内部路径: {}", text);
@@ -1169,26 +1293,31 @@ mod tests {
 
         // 追踪类 header 必须被剥离
         for h in ["x-request-id", "cf-ray", "server", "via"] {
-            assert!(
-                wrapped.headers().get(h).is_none(),
-                "header {} 应被剥离",
-                h
-            );
+            assert!(wrapped.headers().get(h).is_none(), "header {} 应被剥离", h);
         }
 
         // 其它非追踪 header 应保留
         assert_eq!(
-            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("30")
         );
         assert_eq!(
-            wrapped.headers().get("x-custom-debug").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("x-custom-debug")
+                .and_then(|v| v.to_str().ok()),
             Some("keep-me")
         );
 
         // content-type 应是 application/json
         assert_eq!(
-            wrapped.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
     }

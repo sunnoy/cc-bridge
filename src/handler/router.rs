@@ -98,11 +98,12 @@ pub fn build_router(
         }))
         .with_state(state.clone());
 
-    // 组合路由：前端 + 管理 API + 其余全部透传网关
+    // 组合路由：前端 + 管理 API + 客户端额度查询 + 其余全部透传网关
     Router::new()
         .merge(frontend_routes)
         .merge(asset_routes)
         .merge(admin_routes)
+        .route("/v1/usage", get(get_client_usage))
         .fallback(gateway_fallback)
         .with_state(state)
 }
@@ -129,6 +130,23 @@ async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Respon
 /// 统一 JSON 错误响应
 fn err_json(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({"error": msg}))).into_response()
+}
+
+/// 客户端额度查询：`GET /v1/usage`，用客户端 token 鉴权，返回 cc-bridge 内存热态里
+/// 该 token 代表账号的 5h/7d 用量（明文 JSON，无 gzip、无上游请求）。供 statusline
+/// 插件轮询——绕开 claude 对 token 认证不填 stdin `rate_limits` 的门控。
+async fn get_client_usage(State(state): State<AppState>, req: Request) -> Response {
+    let key = extract_key(&req);
+    if key.is_empty() {
+        return err_json(StatusCode::UNAUTHORIZED, "missing api key");
+    }
+    let api_token = match state.token_store.get_by_token(&key).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
+        Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
+    };
+    let usage = state.gateway_svc.usage_for_token(Some(&api_token)).await;
+    (StatusCode::OK, Json(usage)).into_response()
 }
 
 // --- Account Handlers ---
@@ -288,7 +306,9 @@ async fn update_account(
         existing.refresh_token = refresh_token.to_string();
     }
     if updates.get("expires_at").is_some() {
-        existing.expires_at = updates.get("expires_at").and_then(client_datetime_value_to_utc);
+        existing.expires_at = updates
+            .get("expires_at")
+            .and_then(client_datetime_value_to_utc);
     }
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
         existing.proxy_url = proxy_url.to_string();

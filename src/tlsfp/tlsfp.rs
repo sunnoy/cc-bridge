@@ -439,9 +439,7 @@ mod tests {
     }
 
     /// 读取流并累计总字节，直到流结束或出错。返回 (字节数, 耗时, 错误)。
-    async fn drain_stream(
-        resp: reqwest::Response,
-    ) -> (usize, Duration, Option<reqwest::Error>) {
+    async fn drain_stream(resp: reqwest::Response) -> (usize, Duration, Option<reqwest::Error>) {
         let start = Instant::now();
         let mut total = 0usize;
         let mut stream = resp.bytes_stream();
@@ -463,8 +461,7 @@ mod tests {
         // read_timeout=300ms；server 每 50ms 吐 1 个，共 10 个，总耗时 ~500ms > timeout。
         // 旧的 .timeout(300ms) 语义下会被切；新的 .read_timeout(300ms) 不应切。
         let (addr, _stop) = spawn_server().await;
-        let client =
-            make_request_client_with_read_timeout("", Duration::from_millis(300));
+        let client = make_request_client_with_read_timeout("", Duration::from_millis(300));
         let url = format!("http://{}/stream?chunks=10&gap_ms=50", addr);
 
         let resp = client.get(&url).send().await.expect("headers ok");
@@ -490,16 +487,18 @@ mod tests {
         // read_timeout=150ms；server 吐第一个 chunk 后永远挂住。
         // client 应收到第一个 chunk，然后在 ~150ms 后错误退出。
         let (addr, _stop) = spawn_server().await;
-        let client =
-            make_request_client_with_read_timeout("", Duration::from_millis(150));
+        let client = make_request_client_with_read_timeout("", Duration::from_millis(150));
         let url = format!("http://{}/hang", addr);
 
         let resp = client.get(&url).send().await.expect("headers ok");
         let (bytes, elapsed, err) = drain_stream(resp).await;
 
         let err = err.expect("hang 后必须收到错误");
-        assert!(err.is_timeout() || format!("{:?}", err).to_lowercase().contains("time"),
-                "错误类型应为 timeout：{:?}", err);
+        assert!(
+            err.is_timeout() || format!("{:?}", err).to_lowercase().contains("time"),
+            "错误类型应为 timeout：{:?}",
+            err
+        );
         // 第一个 chunk "start" = 5 字节 + 引导字节 "." = 6
         assert!(bytes >= 1, "至少应收到首个引导/chunk: bytes={}", bytes);
         // 触发时机：first frame 之后 ~150ms 内应被切
@@ -515,14 +514,17 @@ mod tests {
         // 更精细：read_timeout=200ms，gap=150ms，吐 8 个 chunk，总耗时 >1.2s。
         // 每个 gap 都 < timeout；如果 reset 正常就能全收；如果没 reset 就早挂。
         let (addr, _stop) = spawn_server().await;
-        let client =
-            make_request_client_with_read_timeout("", Duration::from_millis(200));
+        let client = make_request_client_with_read_timeout("", Duration::from_millis(200));
         let url = format!("http://{}/stream?chunks=8&gap_ms=150", addr);
 
         let resp = client.get(&url).send().await.expect("headers ok");
         let (bytes, elapsed, err) = drain_stream(resp).await;
 
-        assert!(err.is_none(), "read_timeout 应在每个 frame 后 reset: err={:?}", err);
+        assert!(
+            err.is_none(),
+            "read_timeout 应在每个 frame 后 reset: err={:?}",
+            err
+        );
         // 总耗时证明确实跨越了多个 timeout window（150ms*8 = 1.2s > 200ms 单窗）
         assert!(
             elapsed >= Duration::from_millis(1000),

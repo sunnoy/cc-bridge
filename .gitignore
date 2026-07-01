@@ -18,4 +18,5 @@
 /cc-gateway
 /postgresql:
 /tests/
-/claude-code
+/claude-codelogs/
+*.png

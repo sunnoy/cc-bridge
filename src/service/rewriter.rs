@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crate::model::account::{
     Account, BillingMode, CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData,
 };
+use crate::model::mimic_profile;
 
 /// header wire 大小写映射。
 /// Go 的 HTTP 服务器规范化 header，此映射还原 Claude CLI 抓包原始大小写。
@@ -59,36 +60,6 @@ pub enum ClientType {
     API,
 }
 
-const DEFAULT_VERSION: &str = "2.1.81";
-
-/// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
-fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let mut tokens = Vec::new();
-    for t in required.split(',') {
-        let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            tokens.push(t.to_string());
-        }
-    }
-    for t in incoming.split(',') {
-        let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            tokens.push(t.to_string());
-        }
-    }
-    tokens.join(",")
-}
-
-/// 根据模型返回正确的 anthropic-beta 值。
-///
-/// 依据 Claude Code `src/utils/betas.ts` 对 firstParty provider 的规则复刻
-/// （cc-bridge 固定转发到 api.anthropic.com，即 firstParty + claudeAISubscriber）：
-///
-/// - `CLAUDE_CODE_20250219`: 仅非 Haiku 模型
-/// - `OAUTH_BETA_HEADER`   : 始终（claudeAISubscriber）
-/// - `INTERLEAVED_THINKING`: firstParty 规则 `!claude-3-*`
-/// - `REDACT_THINKING`     : 需 ISP 支持（等价于 `!claude-3-*`，默认交互式会话）
 /// 剥离 model id 末尾的 `[1m]` 后缀（Claude Code CLI 用于标记 1M 上下文模式）。
 /// 返回 (去后缀的 model_id, 是否命中 1m)。Anthropic API 不认 `[1m]`，必须剥离并
 /// 另外发 `context-1m-2025-08-07` beta。
@@ -100,37 +71,67 @@ fn strip_1m_suffix(model_id: &str) -> (&str, bool) {
     }
 }
 
-/// - `CONTEXT_MANAGEMENT`  : Claude 4+ 模型（opus-4/sonnet-4/haiku-4）
-/// - `PROMPT_CACHING_SCOPE`: 始终（firstParty）
+/// 根据模型返回正确的 anthropic-beta 值。
+///
+/// 实测自 Claude Code 2.1.196 `/v1/messages` 抓包（API key / AuthToken / OAuth 三种
+/// 认证形态在 messages 上的 beta 集一致；**均不发** `oauth-2025-04-20` 与
+/// `redact-thinking-2026-02-12`——这两个只用于 `/v1/files` 等其它端点）。
+///
+/// 顺序参照 opus（最全样本）；sonnet/haiku 为其子集：
+/// - opus-4-8 ：claude-code, context-1m, interleaved-thinking, thinking-token-count,
+///   context-management, prompt-caching-scope, mid-conversation-system, advisor-tool,
+///   advanced-tool-use, effort, cache-diagnosis
+/// - sonnet-4-6：去掉 context-1m / mid-conversation-system / advanced-tool-use / cache-diagnosis
+/// - haiku-4-5 ：再去掉 effort（haiku 不带 output_config.effort），但**仍发** claude-code-20250219
+///
+/// 注：本函数主要服务 **API 模式**（把裸 API client 伪装成 Claude Code）与 OAuth 校验；
+/// CC 客户端模式下原样保留客户端自带 beta，不调用本函数 clobber。
 pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
     let (base, needs_1m) = strip_1m_suffix(model_id);
     let lower = base.to_lowercase();
-    let is_haiku = lower.contains("haiku");
     let is_claude3 = lower.contains("claude-3-");
-    // firstParty: ISP 等价于 !claude-3-*（源码 betas.ts:107）
-    let supports_isp = !is_claude3;
-    // modelSupportsContextManagement: Claude 4+（源码 betas.ts:134-138）
+    // 现代特性等价于「非 legacy claude-3」（实测 haiku-4-5 同样发送 claude-code-20250219）
+    let modern = !is_claude3;
+    let is_haiku = lower.contains("haiku");
+    // 仅现代 opus（opus-4+）享受 opus 专属 beta；claude-3-opus 走 legacy
+    let is_opus = lower.contains("claude-opus-4");
+    // modelSupportsContextManagement：Claude 4+
     let is_claude4_plus = lower.contains("claude-opus-4")
         || lower.contains("claude-sonnet-4")
-        || lower.contains("claude-haiku-4");
+        || lower.contains("claude-haiku-4")
+        || lower.contains("claude-fable-");
 
     let mut out: Vec<&'static str> = Vec::new();
-    if !is_haiku {
+    if modern {
         out.push("claude-code-20250219");
     }
-    // claudeAISubscriber → OAUTH_BETA_HEADER
-    out.push("oauth-2025-04-20");
-    if supports_isp {
+    // opus 默认开启 1M 上下文；其它模型仅在 [1m] 后缀时
+    if needs_1m || is_opus {
+        out.push("context-1m-2025-08-07");
+    }
+    if modern {
         out.push("interleaved-thinking-2025-05-14");
-        // REDACT_THINKING 取决于非交互/设置，代理默认发送交互态
-        out.push("redact-thinking-2026-02-12");
+        out.push("thinking-token-count-2026-05-13");
     }
     if is_claude4_plus {
         out.push("context-management-2025-06-27");
     }
     out.push("prompt-caching-scope-2026-01-05");
-    if needs_1m {
-        out.push("context-1m-2025-08-07");
+    if is_opus {
+        out.push("mid-conversation-system-2026-04-07");
+    }
+    if modern {
+        out.push("advisor-tool-2026-03-01");
+    }
+    if is_opus {
+        out.push("advanced-tool-use-2025-11-20");
+    }
+    // effort 仅 opus/sonnet（haiku 不带 output_config.effort）
+    if is_claude4_plus && !is_haiku {
+        out.push("effort-2025-11-24");
+    }
+    if is_opus {
+        out.push("cache-diagnosis-2026-04-07");
     }
     out
 }
@@ -159,21 +160,16 @@ impl Rewriter {
         body_map: &serde_json::Value,
     ) -> HashMap<String, String> {
         let env = self.parse_env(account);
-        let version = if env.version.is_empty() {
-            DEFAULT_VERSION
-        } else {
-            &env.version
-        };
+        // version 仅用于 API 模式合成 UA/stainless；CC 模式逐字透传客户端原值（见下），
+        // 避免 mimic_profile 与客户端版本漂移导致 UA↔billing 不自洽。
+        let version = mimic_profile::VERSION;
 
         let mut out = HashMap::new();
 
         if client_type == ClientType::API {
             // API 模式：使用与真实 Claude CLI 匹配的固定 header 集合。
             out.insert("Accept".into(), "application/json".into());
-            out.insert(
-                "User-Agent".into(),
-                format!("claude-cli/{} (external, cli)", version),
-            );
+            out.insert("User-Agent".into(), mimic_profile::user_agent_cli(version));
             out.insert(
                 "anthropic-beta".into(),
                 beta_header_for_model(model_id).into(),
@@ -188,13 +184,16 @@ impl Rewriter {
             out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
             let stainless_os = stainless_os_from_platform(&env.platform);
             out.insert("X-Stainless-Lang".into(), "js".into());
-            out.insert("X-Stainless-Package-Version".into(), "0.70.0".into());
+            out.insert(
+                "X-Stainless-Package-Version".into(),
+                mimic_profile::STAINLESS_PACKAGE_VERSION.into(),
+            );
             out.insert("X-Stainless-OS".into(), stainless_os.into());
             out.insert("X-Stainless-Arch".into(), env.arch.clone());
             out.insert("X-Stainless-Runtime".into(), "node".into());
             out.insert(
                 "X-Stainless-Runtime-Version".into(),
-                env.node_version.clone(),
+                mimic_profile::NODE_VERSION.into(),
             );
             out.insert("X-Stainless-Retry-Count".into(), "0".into());
             out.insert("X-Stainless-Timeout".into(), "600".into());
@@ -239,18 +238,16 @@ impl Rewriter {
                 }
                 let wire_key = resolve_wire_casing(k);
                 match lower.as_str() {
-                    "user-agent" => {
-                        out.insert(wire_key, format!("claude-cli/{} (external, cli)", version));
-                    }
+                    // OS/arch 编码设备身份 → 保持池账号身份（与 body Platform/OS 改写一致）
                     "x-stainless-os" => {
                         out.insert(wire_key, stainless_os.to_string());
                     }
                     "x-stainless-arch" => {
                         out.insert(wire_key, env.arch.clone());
                     }
-                    "x-stainless-runtime-version" => {
-                        out.insert(wire_key, env.node_version.clone());
-                    }
+                    // user-agent / x-stainless-package-version / x-stainless-runtime-version
+                    // 编码客户端版本 → 逐字透传（与 billing 透传哲学一致）。真实 CC 客户端 UA
+                    // 本就权威；强钉 mimic_profile 会在官方升级后造成 UA↔billing 版本漂移。
                     _ => {
                         out.insert(wire_key, v.clone());
                     }
@@ -261,12 +258,13 @@ impl Rewriter {
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
 
-            // 合并客户端 beta 与必需 beta
+            // CC 客户端模式：原样保留客户端自带的 anthropic-beta。真实 Claude Code 已按
+            // 模型/认证/参数发对了现代 beta 集（含顺序），用旧集合 merge 反而会引入错误 token
+            // （如已被 messages 移除的 oauth-2025-04-20）。仅当客户端没带 beta 时才兜底计算。
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
-            out.insert(
-                "anthropic-beta".into(),
-                merge_anthropic_beta(&beta_header_for_model(model_id), &existing_beta),
-            );
+            if existing_beta.trim().is_empty() {
+                out.insert("anthropic-beta".into(), beta_header_for_model(model_id));
+            }
         }
 
         out
@@ -294,7 +292,8 @@ impl Rewriter {
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type);
-        } else if path.contains("/event_logging/batch") {
+        } else if path.contains("/event_logging/batch") || path.contains("/event_logging/v2/batch")
+        {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
             self.rewrite_growthbook_eval(&mut parsed, account);
@@ -302,14 +301,7 @@ impl Rewriter {
             self.rewrite_generic_identity(&mut parsed, account);
         }
 
-        let mut output = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
-
-        // Rewrite 模式下对 /v1/messages 请求计算 cch attestation
-        if path.starts_with("/v1/messages") && account.billing_mode == BillingMode::Rewrite {
-            output = compute_cch_attestation(output);
-        }
-
-        output
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
     }
 
     /// 处理 /v1/messages 请求体。
@@ -402,6 +394,13 @@ impl Rewriter {
                     "device_id".into(),
                     serde_json::Value::String(account.device_id.clone()),
                 );
+                // 补 account_uuid：真实 claude 会从 OAuth 带上 account_uuid；池账号也有，
+                // 入口若缺则用账号值补齐，避免 metadata 与身份不自洽。
+                let uuid = account
+                    .account_uuid
+                    .clone()
+                    .unwrap_or_else(|| derive_account_uuid(account));
+                obj.insert("account_uuid".into(), serde_json::Value::String(uuid));
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                     metadata.insert("user_id".into(), serde_json::Value::String(new_str));
@@ -515,35 +514,20 @@ impl Rewriter {
         version: &str,
         billing_mode: &BillingMode,
     ) {
-        let version = if version.is_empty() {
-            DEFAULT_VERSION
-        } else {
-            version
-        };
-
-        // CCH hash 计算
-        let cch_hash = if *billing_mode == BillingMode::Rewrite {
-            let first_msg = extract_first_user_message(body);
-            if !first_msg.is_empty() {
-                compute_cch(&first_msg, version)
-            } else {
-                let mut bytes = [0u8; 2];
-                rand::thread_rng().fill(&mut bytes);
-                format!("{:x}", u16::from_be_bytes(bytes))[..3].to_string()
-            }
-        } else {
-            String::new()
-        };
+        let _ = version; // 版本随二进制固定（mimic_profile）；billing 不再据此重算
 
         let rewrite = |text: &str| -> String {
             let mut text = text.to_string();
-            if *billing_mode == BillingMode::Rewrite {
-                text = BILLING_VERSION_REGEX
-                    .replace_all(&text, &format!("cc_version={}.{}", version, cch_hash))
-                    .to_string();
-                // 将已有的 cch 值重置为占位符，后续在序列化后通过 xxhash64 重新计算
-                text = CCH_VALUE_REGEX.replace_all(&text, "cch=00000").to_string();
-            } else {
+            // billing header：
+            // - Rewrite：原样透传，不重算 cc_version 后缀、不重置 cch。
+            //   cc_version 的 3-hex 后缀只依赖「首条用户文本 + 版本号」（二进制 two()/_tf()），
+            //   cc-bridge 不改这两者，故客户端自带的后缀对修改后 body 依然正确；重算反而会
+            //   因取到 <system-reminder> 文本而算错（cd9 ≠ 官方 1f5）。
+            //   cch attestation（5-hex）依赖完整 body 序列化，cc-bridge 改 device_id 后本需
+            //   重算，但其算法在 2.1.196 已变（旧 xxh64 seed 失效），待逆向——此处保留客户端
+            //   原值不动。OAuth 池不发 cch，此限制仅影响 firstParty/vertex 池。
+            // - Strip：删除整行 billing header。
+            if *billing_mode != BillingMode::Rewrite {
                 text = BILLING_LINE_REGEX.replace_all(&text, "").to_string();
                 text = BILLING_REGEX.replace_all(&text, "").to_string();
             }
@@ -644,9 +628,22 @@ impl Rewriter {
         let canonical_env = build_canonical_env_map(&env);
 
         for event in events.iter_mut() {
-            let e = match event.as_object_mut() {
-                Some(e) => e,
-                None => continue,
+            // v2 envelope（/api/event_logging/v2/batch）把身份字段放在 event_data 内；
+            // 旧扁平 schema 直接在 event 顶层。两者都要正确改写，否则真实 device_id 会漏改泄漏。
+            let has_event_data = event
+                .get("event_data")
+                .map(|d| d.is_object())
+                .unwrap_or(false);
+            let e = if has_event_data {
+                match event.get_mut("event_data").and_then(|d| d.as_object_mut()) {
+                    Some(e) => e,
+                    None => continue,
+                }
+            } else {
+                match event.as_object_mut() {
+                    Some(e) => e,
+                    None => continue,
+                }
             };
 
             if e.contains_key("device_id") {
@@ -822,53 +819,9 @@ static BILLING_LINE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s*x-anthropic-billing-header:[^\n]*\n?").unwrap());
 static BILLING_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3};[^;]*;?").unwrap());
-/// 仅匹配 cc_version 值部分，用于 Rewrite 模式保留 cc_entrypoint。
-static BILLING_VERSION_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3}").unwrap());
-static CCH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
 static GIT_USER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
-
-// --- CCH Attestation (xxhash64) ---
-
-const CCH_ATTESTATION_SEED: u64 = 0x6E52736AC806831E;
-const CCH_PLACEHOLDER: &[u8] = b"cch=00000";
-
-/// 对序列化后的 body 字节计算 cch attestation 并原地替换占位符。
-/// 算法：xxhash64(body_with_placeholder, seed) 取低 20 bits → 5 位十六进制。
-fn compute_cch_attestation(mut body: Vec<u8>) -> Vec<u8> {
-    if let Some(pos) = body
-        .windows(CCH_PLACEHOLDER.len())
-        .position(|w| w == CCH_PLACEHOLDER)
-    {
-        let hash = xxhash_rust::xxh64::xxh64(&body, CCH_ATTESTATION_SEED);
-        let cch = format!("{:05x}", hash & 0xFFFFF);
-        // "cch=" 占 4 字节，后续 5 字节是 "00000"
-        body[pos + 4..pos + 9].copy_from_slice(cch.as_bytes());
-    }
-    body
-}
-
-// --- CCH fingerprint (SHA256) ---
-
-const CCH_SALT: &str = "59cf53e54c78";
-const CCH_POSITIONS: [usize; 3] = [4, 7, 20];
-
-fn compute_cch(first_user_message_text: &str, version: &str) -> String {
-    let bytes = first_user_message_text.as_bytes();
-    let mut chars = Vec::new();
-    for &pos in &CCH_POSITIONS {
-        if pos < bytes.len() {
-            chars.push(bytes[pos]);
-        } else {
-            chars.push(b'0');
-        }
-    }
-    let input = format!("{}{}{}", CCH_SALT, String::from_utf8_lossy(&chars), version);
-    let hash = Sha256::digest(input.as_bytes());
-    format!("{:x}", hash)[..3].to_string()
-}
 
 /// 从 messages 数组中提取首条用户消息文本。
 fn extract_first_user_message(body: &serde_json::Value) -> String {
@@ -889,6 +842,12 @@ fn extract_first_user_message(body: &serde_json::Value) -> String {
             Some(serde_json::Value::Array(arr)) => {
                 for item in arr {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        // 跳过 <system-reminder> 包裹块：官方 two()/_tf() 在注入 reminder
+                        // 之前计算，取的是真实用户文本。wire body 上 reminder 与真实文本混在
+                        // 同一 content 数组，必须跳过，否则取到 reminder 首字节算错后缀。
+                        if text.trim_start().starts_with("<system-reminder>") {
+                            continue;
+                        }
                         return text.to_string();
                     }
                 }
@@ -1241,11 +1200,7 @@ fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &
 
 /// 将 canonical env 的 platform 映射为 X-Stainless-OS 值。
 fn stainless_os_from_platform(platform: &str) -> &str {
-    match platform {
-        "darwin" => "Mac OS X",
-        "win32" => "Windows",
-        _ => "Linux",
-    }
+    mimic_profile::stainless_os(platform)
 }
 
 fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
@@ -1270,64 +1225,99 @@ mod beta_tests {
     }
 
     #[test]
-    fn sonnet_4_5_gets_full_first_party_set() {
-        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
-        assert!(contains(&b, "claude-code-20250219"));
-        assert!(contains(&b, "oauth-2025-04-20"));
-        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
-        assert!(contains(&b, "redact-thinking-2026-02-12"));
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
-    }
-
-    #[test]
-    fn opus_4_6_gets_full_first_party_set() {
-        let b = compute_betas_for_model("claude-opus-4-6");
-        assert!(contains(&b, "claude-code-20250219"));
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
-    }
-
-    #[test]
-    fn haiku_4_5_excludes_claude_code_but_keeps_isp_and_context_mgmt() {
-        let b = compute_betas_for_model("claude-haiku-4-5");
-        // Haiku 分支不发 claude-code-20250219
-        assert!(!contains(&b, "claude-code-20250219"));
-        // 但仍支持 ISP / context management / prompt-caching-scope
-        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
-        assert!(contains(&b, "redact-thinking-2026-02-12"));
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
-        assert!(contains(&b, "oauth-2025-04-20"));
-    }
-
-    #[test]
-    fn haiku_3_5_strips_isp_and_context_mgmt() {
-        let b = compute_betas_for_model("claude-3-5-haiku-20241022");
-        assert!(!contains(&b, "claude-code-20250219"));
-        // claude-3-* 不支持 ISP（源码 betas.ts:107）
-        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
+    fn sonnet_4_set_matches_2_1_196() {
+        // 实测 2.1.196 sonnet /v1/messages（API key 样本）的精确集合与顺序
+        let b = compute_betas_for_model("claude-sonnet-4-6");
+        assert_eq!(
+            b,
+            vec![
+                "claude-code-20250219",
+                "interleaved-thinking-2025-05-14",
+                "thinking-token-count-2026-05-13",
+                "context-management-2025-06-27",
+                "prompt-caching-scope-2026-01-05",
+                "advisor-tool-2026-03-01",
+                "effort-2025-11-24",
+            ]
+        );
+        // 已被 messages 移除的 token 不应出现
+        assert!(!contains(&b, "oauth-2025-04-20"));
         assert!(!contains(&b, "redact-thinking-2026-02-12"));
-        // Claude 3 不支持 context-management
+        // sonnet 非 opus：无 1m / mid-conversation / advanced-tool-use / cache-diagnosis
+        assert!(!contains(&b, "context-1m-2025-08-07"));
+        assert!(!contains(&b, "mid-conversation-system-2026-04-07"));
+    }
+
+    #[test]
+    fn opus_4_8_set_matches_2_1_196() {
+        // 实测 2.1.196 opus-4-8 /v1/messages（OAuth 抓包）的精确集合与顺序
+        let b = compute_betas_for_model("claude-opus-4-8");
+        assert_eq!(
+            b,
+            vec![
+                "claude-code-20250219",
+                "context-1m-2025-08-07",
+                "interleaved-thinking-2025-05-14",
+                "thinking-token-count-2026-05-13",
+                "context-management-2025-06-27",
+                "prompt-caching-scope-2026-01-05",
+                "mid-conversation-system-2026-04-07",
+                "advisor-tool-2026-03-01",
+                "advanced-tool-use-2025-11-20",
+                "effort-2025-11-24",
+                "cache-diagnosis-2026-04-07",
+            ]
+        );
+        assert!(!contains(&b, "oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn haiku_4_5_includes_claude_code_but_no_effort() {
+        let b = compute_betas_for_model("claude-haiku-4-5");
+        // 实测 2.1.196：haiku-4-5 仍发送 claude-code-20250219
+        assert!(contains(&b, "claude-code-20250219"));
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(contains(&b, "thinking-token-count-2026-05-13"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+        assert!(contains(&b, "advisor-tool-2026-03-01"));
+        // haiku 不带 output_config.effort → 无 effort beta；也无 opus 专属 / oauth / redact
+        assert!(!contains(&b, "effort-2025-11-24"));
+        assert!(!contains(&b, "context-1m-2025-08-07"));
+        assert!(!contains(&b, "oauth-2025-04-20"));
+        assert!(!contains(&b, "redact-thinking-2026-02-12"));
+    }
+
+    #[test]
+    fn haiku_3_5_is_legacy() {
+        let b = compute_betas_for_model("claude-3-5-haiku-20241022");
+        // claude-3-* 为 legacy：无现代 beta
+        assert!(!contains(&b, "claude-code-20250219"));
+        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "thinking-token-count-2026-05-13"));
         assert!(!contains(&b, "context-management-2025-06-27"));
-        // OAuth + prompt-caching-scope 仍存在
-        assert!(contains(&b, "oauth-2025-04-20"));
+        assert!(!contains(&b, "advisor-tool-2026-03-01"));
+        assert!(!contains(&b, "oauth-2025-04-20"));
+        // prompt-caching-scope 始终
         assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
     }
 
     #[test]
-    fn claude_3_opus_behaves_as_legacy() {
+    fn claude_3_opus_is_legacy_not_modern_opus() {
         let b = compute_betas_for_model("claude-3-opus-20240229");
-        assert!(contains(&b, "claude-code-20250219")); // 非 haiku
+        // 名字含 opus 但不是 opus-4+：不应享受现代/opus 专属 beta
+        assert!(!contains(&b, "claude-code-20250219"));
         assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
         assert!(!contains(&b, "context-management-2025-06-27"));
+        assert!(!contains(&b, "context-1m-2025-08-07"));
+        assert!(!contains(&b, "mid-conversation-system-2026-04-07"));
         assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
     }
 
     #[test]
     fn ordering_is_stable_across_calls() {
-        let a = compute_betas_for_model("claude-sonnet-4-5");
-        let b = compute_betas_for_model("claude-sonnet-4-5");
+        let a = compute_betas_for_model("claude-sonnet-4-6");
+        let b = compute_betas_for_model("claude-sonnet-4-6");
         assert_eq!(a, b);
     }
 
@@ -1348,9 +1338,206 @@ mod beta_tests {
 
     #[test]
     fn strip_1m_suffix_helper() {
-        assert_eq!(strip_1m_suffix("claude-sonnet-4-6[1m]"), ("claude-sonnet-4-6", true));
-        assert_eq!(strip_1m_suffix("claude-opus-4-7[1m]"), ("claude-opus-4-7", true));
-        assert_eq!(strip_1m_suffix("claude-sonnet-4-5-20250929"), ("claude-sonnet-4-5-20250929", false));
+        assert_eq!(
+            strip_1m_suffix("claude-sonnet-4-6[1m]"),
+            ("claude-sonnet-4-6", true)
+        );
+        assert_eq!(
+            strip_1m_suffix("claude-opus-4-7[1m]"),
+            ("claude-opus-4-7", true)
+        );
+        assert_eq!(
+            strip_1m_suffix("claude-sonnet-4-5-20250929"),
+            ("claude-sonnet-4-5-20250929", false)
+        );
         assert_eq!(strip_1m_suffix("[1m]"), ("", true));
+    }
+}
+
+#[cfg(test)]
+mod mimic_contract_tests {
+    //! 端到端契约比对：把 cc-bridge rewrite 管线的输出对照真实 Claude Code 2.1.196
+    //! `/v1/messages` 抓包（GOLD 样本）。故意用 stale 账号存值构造，验证 rewriter 强制
+    //! 矫正到当前 profile，且 CC 模式**原样保留**客户端 anthropic-beta（不被旧集合 clobber）。
+    use super::*;
+    use crate::model::account::{AccountAuthType, AccountStatus};
+    use chrono::Utc;
+
+    // 真实 2.1.196 opus-4-8 /v1/messages 抓到的 anthropic-beta（含顺序）。
+    const GOLD_OPUS_BETA: &str = "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,cache-diagnosis-2026-04-07";
+
+    fn stale_linux_account() -> Account {
+        // 全部填 stale：rewriter 应忽略并矫正到 profile（2.1.196 / v26.3.0 / 0.94.0）。
+        let env = CanonicalEnvData {
+            platform: "linux".into(),
+            platform_raw: "linux".into(),
+            arch: "x64".into(),
+            node_version: "v22.15.0".into(),
+            terminal: "ssh-session".into(),
+            package_managers: "npm".into(),
+            runtimes: "node".into(),
+            is_claude_ai_auth: true,
+            version: "2.1.81".into(),
+            version_base: "2.1.81".into(),
+            build_time: "2026-03-20T21:26:18Z".into(),
+            deployment_environment: "unknown-linux".into(),
+            vcs: "git".into(),
+            ..Default::default()
+        };
+        Account {
+            id: 1,
+            name: "tester".into(),
+            email: "tester@example.com".into(),
+            status: AccountStatus::Active,
+            auth_type: AccountAuthType::Oauth,
+            setup_token: String::new(),
+            access_token: "acc".into(),
+            refresh_token: "ref".into(),
+            expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            oauth_refreshed_at: None,
+            auth_error: String::new(),
+            proxy_url: String::new(),
+            device_id: "a".repeat(64),
+            canonical_env: serde_json::to_value(env).unwrap(),
+            canonical_prompt: serde_json::json!({}),
+            canonical_process: serde_json::json!({}),
+            billing_mode: BillingMode::Strip,
+            account_uuid: Some("11111111-2222-3333-4444-555555555555".into()),
+            organization_uuid: None,
+            subscription_type: Some("max".into()),
+            concurrency: 3,
+            priority: 50,
+            rate_limited_at: None,
+            rate_limit_reset_at: None,
+            disable_reason: String::new(),
+            auto_telemetry: false,
+            telemetry_count: 0,
+            usage_data: serde_json::json!({}),
+            usage_fetched_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// CC 客户端模式：版本类 header（UA / x-stainless-package-version / runtime-version）
+    /// 逐字透传客户端原值（与 billing 透传哲学一致，避免 mimic_profile 与客户端版本漂移
+    /// 导致 UA↔billing 不自洽）；身份类 header（x-stainless-os）矫正到池账号身份；
+    /// 客户端 anthropic-beta 原样保留。
+    #[test]
+    fn cc_mode_preserves_client_version_headers_and_beta() {
+        let account = stale_linux_account();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "user-agent".into(),
+            "claude-cli/2.1.150 (external, cli)".into(),
+        );
+        headers.insert("anthropic-beta".into(), GOLD_OPUS_BETA.into());
+        headers.insert("anthropic-version".into(), "2023-06-01".into());
+        headers.insert("x-stainless-package-version".into(), "0.80.0".into());
+        headers.insert("x-stainless-os".into(), "Linux".into());
+        headers.insert("x-stainless-runtime-version".into(), "v24.0.0".into());
+        headers.insert("x-app".into(), "cli".into());
+
+        let body = serde_json::json!({});
+        let out = Rewriter::new().rewrite_headers(
+            &headers,
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-4-8",
+            &body,
+        );
+
+        // 版本类：逐字透传客户端原值（不再强钉 mimic_profile，避免版本漂移不自洽）
+        assert_eq!(
+            out.get("User-Agent").unwrap(),
+            "claude-cli/2.1.150 (external, cli)"
+        );
+        assert_eq!(out.get("X-Stainless-Package-Version").unwrap(), "0.80.0");
+        assert_eq!(out.get("X-Stainless-Runtime-Version").unwrap(), "v24.0.0");
+        // 身份类：矫正到池账号身份（linux 账号 → Linux）
+        assert_eq!(out.get("X-Stainless-OS").unwrap(), "Linux");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+        // 关键：客户端自带的现代 beta 集原样透传，不被旧规则改写
+        assert_eq!(out.get("anthropic-beta").unwrap(), GOLD_OPUS_BETA);
+    }
+
+    /// API 模式（裸 client 伪装成 CC）：完整发齐 2.1.196 契约。
+    #[test]
+    fn api_mode_emits_full_2_1_196_contract() {
+        let account = stale_linux_account();
+        let headers = HashMap::new();
+        let body = serde_json::json!({});
+        let out = Rewriter::new().rewrite_headers(
+            &headers,
+            &account,
+            ClientType::API,
+            "claude-opus-4-8",
+            &body,
+        );
+        assert_eq!(
+            out.get("User-Agent").unwrap(),
+            "claude-cli/2.1.196 (external, cli)"
+        );
+        assert_eq!(out.get("X-Stainless-Package-Version").unwrap(), "0.94.0");
+        assert_eq!(out.get("X-Stainless-Runtime-Version").unwrap(), "v26.3.0");
+        assert_eq!(out.get("X-Stainless-OS").unwrap(), "Linux");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(out.get("x-app").unwrap(), "cli");
+        // API 模式 beta 由 profile 计算，opus 全集且不含 oauth-2025-04-20 / redact-thinking
+        assert_eq!(out.get("anthropic-beta").unwrap(), GOLD_OPUS_BETA);
+        let beta = out.get("anthropic-beta").unwrap();
+        assert!(!beta.contains("oauth-2025-04-20"));
+        assert!(!beta.contains("redact-thinking"));
+    }
+
+    /// extract_first_user_message 必须跳过 <system-reminder> 块，取注入前的真实用户文本
+    /// （官方 _tf 在注入 reminder 之前计算）。
+    #[test]
+    fn extract_first_user_message_skips_system_reminder() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nAs you answer the user's questions...\n</system-reminder>"},
+                    {"type": "text", "text": "hi\nhi\n"}
+                ]
+            }]
+        });
+        assert_eq!(extract_first_user_message(&body), "hi\nhi\n");
+    }
+
+    /// CC 模式 Rewrite：billing header 原样透传，cc_version 后缀与 cch 均不被重算覆盖。
+    #[test]
+    fn cc_mode_rewrite_preserves_client_billing() {
+        let mut account = stale_linux_account();
+        account.billing_mode = BillingMode::Rewrite;
+
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.196.1f5; cc_entrypoint=sdk-cli; cch=bf8ab;"},
+                {"type": "text", "text": "You are Claude Code."}
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi\nhi\n"}]
+            }]
+        });
+        let out = Rewriter::new().rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+        );
+        let out_json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys0 = out_json["system"][0]["text"].as_str().unwrap();
+        // cc_version 后缀保留客户端原值 1f5，不被重算成 cd9
+        assert!(
+            sys0.contains("cc_version=2.1.196.1f5"),
+            "suffix not preserved: {sys0}"
+        );
+        assert!(!sys0.contains("cd9"), "suffix recomputed to cd9: {sys0}");
+        // cch 保留客户端原值 bf8ab（不重置 00000、不用旧 seed 覆盖）
+        assert!(sys0.contains("cch=bf8ab"), "cch not preserved: {sys0}");
     }
 }

@@ -472,9 +472,9 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 | 功能 | 说明 |
 |------|------|
 | **拦截** | 客户端遥测请求返回 200，不转发上游 |
-| **代发** | `/api/event_logging/batch`（每 10s）、`/api/eval/sdk-*`（每 6h） |
+| **代发** | `/api/event_logging/v2/batch`（每 10s）、`/api/eval/sdk-*`（每 6h） |
 | **触发** | 账号收到 `/v1/messages` 请求时激活遥测会话（10min TTL，自动续期） |
-| **拦截路径** | `/api/event_logging/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
+| **拦截路径** | `/api/event_logging/v2/batch`（兼容旧 `/api/event_logging/batch`）、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
 
 > Datadog 遥测由客户端直连 `browser-intake-datadoghq.com`，无法通过网关拦截。建议在网络层屏蔽。
 
@@ -683,7 +683,7 @@ cc-bridge/
 | 路径 | 改写内容 |
 |------|---------|
 | `/v1/messages` | 系统提示词注入、`metadata.user_id`、环境/进程指纹、`cache_control`、billing 处理 |
-| `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
+| `/api/event_logging/v2/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
 

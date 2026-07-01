@@ -126,6 +126,24 @@ impl AccountService {
         Ok((accounts, total))
     }
 
+    /// 客户端额度查询用：挑一个「代表账号」返回其 id，供 `/v1/usage` 读热态额度。
+    /// 与 `select_account` 不同：**不按限流可用性过滤**（额度快满时最需要显示，不能因
+    /// 撞墙就选不出账号），只按 token 的 allowed/blocked 过滤，取最高优先级的可调度账号。
+    /// 数据只读，无副作用，不触发上游。
+    pub async fn representative_account_id(
+        &self,
+        allowed_ids: &[i64],
+        blocked_ids: &[i64],
+    ) -> Option<i64> {
+        let accounts = self.store.list_schedulable().await.ok()?;
+        accounts
+            .into_iter()
+            .filter(|a| !blocked_ids.contains(&a.id))
+            .filter(|a| allowed_ids.is_empty() || allowed_ids.contains(&a.id))
+            .max_by_key(|a| a.priority)
+            .map(|a| a.id)
+    }
+
     /// 使用粘性会话为请求选择账号。
     /// `exclude_ids` 为令牌的不可用账号，`allowed_ids` 为令牌的可用账号（空表示不限制）。
     pub async fn select_account(
@@ -254,8 +272,7 @@ impl AccountService {
         // 1) 60s 内有成功查询 → 直接复用 DB 数据，不打上游。
         if let Some(fetched_at) = account.usage_fetched_at {
             let age = Utc::now().signed_duration_since(fetched_at);
-            if age.num_seconds() >= 0
-                && age.to_std().map(|d| d < USAGE_FRESH_TTL).unwrap_or(false)
+            if age.num_seconds() >= 0 && age.to_std().map(|d| d < USAGE_FRESH_TTL).unwrap_or(false)
             {
                 info!(
                     "refresh_usage: account {} → cache hit (age={}s, ttl=60s)",
@@ -314,10 +331,7 @@ impl AccountService {
     /// Same as `resolve_upstream_token` but reuses an already-fetched `Account`,
     /// avoiding a redundant `get_by_id` round-trip. The refresh path still
     /// re-reads fresh data internally, so stale local fields are safe.
-    pub async fn resolve_upstream_token_with(
-        &self,
-        account: &Account,
-    ) -> Result<String, AppError> {
+    pub async fn resolve_upstream_token_with(&self, account: &Account) -> Result<String, AppError> {
         match account.auth_type {
             AccountAuthType::SetupToken => {
                 if account.setup_token.is_empty() {
