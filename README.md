@@ -670,6 +670,13 @@ cc-bridge/
 
 `POST /admin/accounts/:id/usage` 主动调 Anthropic `/api/oauth/usage`（**仅 OAuth 账号**；SetupToken 返回用户友好错误）。60 秒 DB 级去抖动。结果写入 `usage_data` 并同步到 `LimitStore` 内存热态。前端 Accounts 页面打开期间每 60 秒重新拉账号列表，从 DB 读取最新 `usage_data` 和 `rate_limit_reset_at` 显示进度条。**无后台定时 poller**（Phase 1.5 已移除 `USAGE_POLL_INTERVAL_SECS`）。
 
+### 客户端额度查询 `GET /v1/usage`
+
+客户端 token 鉴权，返回该 token 代表账号的 5h/7d 用量（读 `LimitStore` 内存热态，**自身不打上游**；明文 JSON、无 gzip）。供 statusline 等客户端轮询显示额度——绕开 claude 对 token 认证不填 stdin `rate_limits` 的门控。容器重启后热态空返回 `{}`，来流量即填。
+
+statusline-pro（ccsp）接入配置与说明见 [`docs/statusline/`](docs/statusline/)。
+
+
 ### 请求头改写
 
 - User-Agent → `claude-code/<version> (external, cli)`

@@ -1,0 +1,63 @@
+# cc-bridge 池账号额度 statusline 组件
+# 放到 ~/.claude/statusline-pro/components/rate_limit.toml
+#
+# 作用：在 statusline 显示池账号 5h/7d 用量（数据取自 cc-bridge 的 GET /v1/usage
+#       内存热态，零上游请求）。用法/原理见同目录 README.md。
+#
+# ⚠️ 必改：把两处 detection.contains 换成你 cc-bridge base URL 的独有特征
+#         （域名或端口，如 "cc.example.com" 或 "5674"）。不改的话，指向官方 API
+#         时会每次渲染都白打一次 官方/v1/usage（带 token）。
+
+[meta]
+description = "cc-bridge 池账号额度（热态 /v1/usage，零上游）"
+version = "1.0"
+
+[widgets]
+
+[widgets.ccbridge_5h]
+enabled = true
+type = "api"
+row = 2
+col = 0
+nerd_icon = ""
+emoji_icon = "⏳"
+text_icon = "[5h]"
+template = "5h {utilization:.0f}%"
+
+[widgets.ccbridge_5h.detection]
+env = "ANTHROPIC_BASE_URL"
+contains = "REPLACE_WITH_YOUR_CCBRIDGE_HOST_OR_PORT"
+
+[widgets.ccbridge_5h.api]
+base_url = "${ANTHROPIC_BASE_URL}"
+endpoint = "/v1/usage"
+method = "GET"
+timeout = 3000
+data_path = "$.five_hour"
+
+[widgets.ccbridge_5h.api.headers]
+"Authorization" = "Bearer ${ANTHROPIC_AUTH_TOKEN}"
+
+[widgets.ccbridge_7d]
+enabled = true
+type = "api"
+row = 2
+col = 1
+nerd_icon = ""
+emoji_icon = "📅"
+text_icon = "[7d]"
+template = "7d {utilization:.0f}%"
+
+[widgets.ccbridge_7d.detection]
+env = "ANTHROPIC_BASE_URL"
+contains = "REPLACE_WITH_YOUR_CCBRIDGE_HOST_OR_PORT"
+
+[widgets.ccbridge_7d.api]
+base_url = "${ANTHROPIC_BASE_URL}"
+endpoint = "/v1/usage"
+method = "GET"
+timeout = 3000
+data_path = "$.seven_day"
+
+[widgets.ccbridge_7d.api.headers]
+"Authorization" = "Bearer ${ANTHROPIC_AUTH_TOKEN}"
